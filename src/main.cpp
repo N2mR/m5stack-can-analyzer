@@ -5,16 +5,19 @@
 #include <cmath>
 #include <BluetoothSerial.h>
 #include <sstream>
+#include <vector>
 #include <../.pio/libdeps/m5stack-core2/ArduinoJson/ArduinoJson.h>
 
  enum class DisplayType
 {
 	Lean,
-	CAN
+	CAN,
+	Debug
 };
 
 
 // 機能切り替え
+//DisplayType::Lean or CAN
 DisplayType enmDisplayType = DisplayType::Lean;
 bool blneedFillBlack = false;
 // IMU
@@ -37,6 +40,11 @@ String strMasterName = "M5Stack_master";
 String strSlaveName = "M5StickC";
 bool blConnect = false;
 String data = "";
+
+// DisplayType::Debug
+std::vector<std::string> lstBuff = {};
+File csvFile;
+char target = ',';
 
 // GUI
 bool drawAngleIndicator(float kalmanY);
@@ -76,6 +84,14 @@ void setup() {
 	lastMs = micros();
 	// Bluetooth
 	SerialBT.begin(strMasterName, true);
+
+	// CANのデータフレームをSDカードに保存する機能
+	SD.begin();
+	Wire.begin();
+	//SDカードにDataファイルがなければ作成する
+	if (!SD.exists("/Data")) {
+		SD.mkdir("/Data");
+	}
 }
 
 void loop() {
@@ -92,8 +108,9 @@ void loop() {
 		enmDisplayType = DisplayType::CAN;
 		blneedFillBlack = true;
 	}
-	else{
-		// 何もしない
+	else if(M5.BtnC.wasPressed()){
+		enmDisplayType = DisplayType::Debug;
+		blneedFillBlack = true;
 	}
 
 	// 機能を切り替える場合、前機能の画面をリセットする必要がある
@@ -190,6 +207,89 @@ void loop() {
 					M5.Lcd.setCursor(180, 135);
 					M5.Lcd.fillRect(180, 135, 100, 25, BLACK);
 					M5.Lcd.println(String(throttle));
+
+				}
+			}
+			break;
+		case DisplayType::Debug:
+			{
+				// slave(M5StickC)へ接続
+				if (!blConnect)
+				{
+					if (tick % 50 == 0)
+					{
+						blConnect = SerialBT.connect(strSlaveName);
+						if (blConnect)
+						{
+							M5.Lcd.fillScreen(BLACK);
+							M5.Lcd.setTextSize(2);
+							M5.Lcd.setCursor(50, 20);
+							M5.Lcd.printf("Connected.");
+						}
+						else
+						{
+							M5.Lcd.fillScreen(BLACK);
+							M5.Lcd.setTextSize(2);
+							M5.Lcd.setCursor(50, 20);
+							M5.Lcd.printf("Not Connected.");
+						}
+					}
+				}
+
+				if (SerialBT.available())
+				{
+					std::string canData = "";
+					while (SerialBT.available())
+					{
+						char data = (char)SerialBT.read();
+						if (data == '\n')
+						{
+							break;
+						}
+						else
+						{
+							canData += data;
+						}
+					}
+
+					if (canData != "")
+					{
+						// レコードに含まれるカンマの数をカウント
+						uint32_t count = std::count(canData.begin(), canData.end(), target);
+						// 1レコードの最大のカンマ数は11のため(timestamp:1, msgID: 1, DLC:1, DataFrameの最大: 8)
+						// それ以外はデータ不正のため無視する
+						if (4 <= count && count <= 11)
+						{
+							lstBuff.push_back(canData);
+						}
+					}
+
+					// バッファに100件までのレコードを保持する
+					if (100 < lstBuff.size())
+					{
+						M5.Lcd.setTextSize(2);
+						M5.Lcd.setCursor(50, 100);
+						M5.Lcd.fillScreen(BLACK);
+						M5.Lcd.println("writing...");
+						M5.Lcd.setCursor(50, 150);
+						M5.Lcd.println(lstBuff[0].c_str());
+
+
+						// 出力ファイル作成
+						char fileName[99];  //csvファイル名を格納する変数
+						snprintf(fileName, 99, "/Data/log.csv");  //Dataフォルダにlog.csvを作成
+						csvFile = SD.open(fileName, FILE_APPEND);
+						// SDに書き込む
+						for (const auto& strCanData : lstBuff)
+						{
+							csvFile.print(strCanData.c_str());
+							csvFile.print("\n");
+						}
+						csvFile.close();
+
+						// バッファのクリア
+						lstBuff.clear();
+					}
 
 				}
 			}
