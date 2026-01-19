@@ -19,7 +19,6 @@
 // 機能切り替え
 //DisplayType::Lean or CAN
 DisplayType enmDisplayType = DisplayType::Lean;
-bool blneedFillBlack = false;
 // IMU
 //x, y, zの順
 float acc[3];
@@ -60,6 +59,173 @@ float getPitch();
 // CANData
 bool drawThrottleAngle();
 
+void leanTask(void* arg)
+{
+	while(1)
+	{
+		if (enmDisplayType == DisplayType::Lean)
+		{
+			//10回に1回だけ描画
+			if(tick % 10 == 0){
+
+				// 左右の傾きを取得
+				readGyro();
+				applyCalibration();
+				float dt = (micros() - lastMs) / 1000000.0;
+				lastMs = micros();
+				float roll = getRoll();
+				float pitch = getPitch();
+				
+				kalAngleX = kalmanX.getAngle(roll, gyro[0], dt);
+				kalAngleY = kalmanY.getAngle(pitch, gyro[1], dt);
+
+				// 左右の傾きをディスプレイ表示
+				drawMaxLean();
+				drawAngleIndicator(kalAngleY);
+			}
+			vTaskDelay(pdTICKS_TO_MS(10));
+		}
+	}
+}
+
+void canTask(void* arg)
+{
+	while (1)
+	{
+		// if (SerialBT.available())
+		// {
+		// 	std::string recv = "";
+		// 	while (SerialBT.available())
+		// 	{
+		// 		recv += (char)SerialBT.read();
+		// 	}
+			
+		// 	char delm = ' ';
+
+		// 	const char* charRecv = recv.c_str();
+
+		// 	StaticJsonDocument<200> doc;
+		// 	deserializeJson(doc, charRecv);
+
+		// 	const char* rpm = doc["rpm"];
+		// 	const char* throttle = doc["throttle"];
+
+		// 	String RPM = "RPM: ";
+		// 	String Throttle = "Throttle: ";
+		// 	M5.Lcd.setTextSize(2);
+		// 	M5.Lcd.setCursor(50, 70);
+		// 	M5.Lcd.println(RPM);
+		// 	M5.Lcd.setCursor(50, 140);
+		// 	M5.Lcd.println(Throttle);
+
+		// 	M5.Lcd.setTextSize(3);
+		// 	M5.Lcd.setCursor(140, 65);
+		// 	M5.Lcd.fillRect(140, 65, 100, 25, BLACK);
+		// 	M5.Lcd.println(String(rpm));
+		// 	M5.Lcd.setCursor(180, 135);
+		// 	M5.Lcd.fillRect(180, 135, 100, 25, BLACK);
+		// 	M5.Lcd.println(String(throttle));
+
+		// }
+
+		vTaskDelay(pdTICKS_TO_MS(10));
+	}
+	
+}
+
+// SerialBTが未接続の場合は接続を試みるタスク
+void serialBTConnectionTask(void* arg)
+{
+	while (1)
+	{
+		// slave(M5StickC)へ接続
+		if (!blConnect)
+		{
+			blConnect = SerialBT.connect(strSlaveName);
+			if (blConnect)
+			{
+				M5.Lcd.fillScreen(BLACK);
+				M5.Lcd.setTextSize(2);
+				M5.Lcd.setCursor(50, 20);
+				M5.Lcd.printf("Connected.");
+			}
+			else
+			{
+				M5.Lcd.fillScreen(BLACK);
+				M5.Lcd.setTextSize(2);
+				M5.Lcd.setCursor(50, 20);
+				M5.Lcd.printf("Not Connected.");
+			}
+		}
+
+		vTaskDelay(pdTICKS_TO_MS(10));
+	}
+}
+
+void debugTask(void* arg)
+{
+	while (1)
+	{
+		if (SerialBT.available())
+		{
+			std::string canData = "";
+			while (SerialBT.available())
+			{
+				char data = (char)SerialBT.read();
+				if (data == '\n')
+				{
+					break;
+				}
+				else
+				{
+					canData += data;
+				}
+			}
+
+			if (canData != "")
+			{
+				// レコードに含まれるカンマの数をカウント
+				uint32_t count = std::count(canData.begin(), canData.end(), target);
+				// 1レコードの最大のカンマ数は11のため(timestamp:1, msgID: 1, DLC:1, DataFrameの最大: 8)
+				// それ以外はデータ不正のため無視する
+				if (4 <= count && count <= 11)
+				{
+					lstBuff.push_back(canData);
+				}
+			}
+
+			// バッファに100件までのレコードを保持する
+			if (100 < lstBuff.size())
+			{
+				M5.Lcd.setTextSize(2);
+				M5.Lcd.setCursor(50, 100);
+				M5.Lcd.fillScreen(BLACK);
+				M5.Lcd.println("writing...");
+				M5.Lcd.setCursor(50, 150);
+				M5.Lcd.println(lstBuff[0].c_str());
+
+
+				// 出力ファイル作成
+				char fileName[99];  //csvファイル名を格納する変数
+				snprintf(fileName, 99, "/Data/log.csv");  //Dataフォルダにlog.csvを作成
+				csvFile = SD.open(fileName, FILE_APPEND);
+				// SDに書き込む
+				for (const auto& strCanData : lstBuff)
+				{
+					csvFile.print(strCanData.c_str());
+					csvFile.print("\n");
+				}
+				csvFile.close();
+
+				// バッファのクリア
+				lstBuff.clear();
+			}
+
+		}
+		vTaskDelay(pdTICKS_TO_MS(10));
+	}
+}
+
 void setup() {
   	M5.begin();
 	Serial.begin(9600);
@@ -92,8 +258,18 @@ void setup() {
 	if (!SD.exists("/Data")) {
 		SD.mkdir("/Data");
 	}
+
+	// Lean描画タスク
+	xTaskCreate(leanTask, "leanTask", 4096, NULL, 1, NULL);
+	// CAN通信表示タスク
+	xTaskCreate(canTask, "canTask", 4096, NULL, 1, NULL);
+	// CANデータをSDカードに保存する
+	xTaskCreate(debugTask, "debugTask", 4096, NULL, 1, NULL);
+	// SerialBTの接続タスク
+	xTaskCreate(serialBTConnectionTask, "serialBTConnectionTask", 4096, NULL, 1, NULL);
 }
 
+DisplayType enmBeforeDisplayType = enmDisplayType;
 void loop() {
 	tick++;
 	// ボタンによって表示内容を切り分ける
@@ -101,201 +277,20 @@ void loop() {
 	if (M5.BtnA.wasPressed())
 	{
 		enmDisplayType = DisplayType::Lean;
-		blneedFillBlack = true;
 	} 
 	else if(M5.BtnB.wasPressed())
 	{
 		enmDisplayType = DisplayType::CAN;
-		blneedFillBlack = true;
 	}
 	else if(M5.BtnC.wasPressed()){
 		enmDisplayType = DisplayType::Debug;
-		blneedFillBlack = true;
 	}
 
-	// 機能を切り替える場合、前機能の画面をリセットする必要がある
-	// リセットのフラグが立っている場合、画面を黒で塗りつぶす
-	if (blneedFillBlack)
+	// 機能を切り替える場合は前機能の画面をリセットする
+	if (enmDisplayType != enmBeforeDisplayType)
 	{
+		enmBeforeDisplayType = enmDisplayType;
 		M5.Lcd.fillScreen(BLACK);
-		blneedFillBlack = false;
-	}
-	else
-	{
-		// 何もしない
-	}
-
-	// 機能ごとに処理を分ける
-	switch (enmDisplayType)
-	{
-		case DisplayType::Lean:		// 傾きを表示する
-
-			{
-				//10回に1回だけ描画
-				if(tick % 10 == 0){
-
-					// 左右の傾きを取得
-					readGyro();
-					applyCalibration();
-					float dt = (micros() - lastMs) / 1000000.0;
-					lastMs = micros();
-					float roll = getRoll();
-					float pitch = getPitch();
-					
-					kalAngleX = kalmanX.getAngle(roll, gyro[0], dt);
-					kalAngleY = kalmanY.getAngle(pitch, gyro[1], dt);
-
-					// 左右の傾きをディスプレイ表示
-					drawMaxLean();
-					drawAngleIndicator(kalAngleY);
-
-				}
-			}
-			break;
-		case DisplayType::CAN:
-			{
-				// slave(M5StickC)へ接続
-				if (!blConnect)
-				{
-					if (tick % 100 == 0)
-					{
-						blConnect = SerialBT.connect(strSlaveName);
-						if (blConnect)
-						{
-							M5.Lcd.fillScreen(BLACK);
-						}
-						else
-						{
-							M5.Lcd.fillScreen(BLACK);
-							M5.Lcd.setTextSize(2);
-							M5.Lcd.setCursor(50, 20);
-							M5.Lcd.printf("Not Connected.");
-						}
-					}
-				}
-
-				if (SerialBT.available())
-				{
-					std::string recv = "";
-					while (SerialBT.available())
-					{
-						recv += (char)SerialBT.read();
-					}
-					
-					char delm = ' ';
-
-					const char* charRecv = recv.c_str();
-
-					StaticJsonDocument<200> doc;
-					deserializeJson(doc, charRecv);
-
-					const char* rpm = doc["rpm"];
-					const char* throttle = doc["throttle"];
-
-					String RPM = "RPM: ";
-					String Throttle = "Throttle: ";
-					M5.Lcd.setTextSize(2);
-					M5.Lcd.setCursor(50, 70);
-					M5.Lcd.println(RPM);
-					M5.Lcd.setCursor(50, 140);
-					M5.Lcd.println(Throttle);
-
-					M5.Lcd.setTextSize(3);
-					M5.Lcd.setCursor(140, 65);
-					M5.Lcd.fillRect(140, 65, 100, 25, BLACK);
-					M5.Lcd.println(String(rpm));
-					M5.Lcd.setCursor(180, 135);
-					M5.Lcd.fillRect(180, 135, 100, 25, BLACK);
-					M5.Lcd.println(String(throttle));
-
-				}
-			}
-			break;
-		case DisplayType::Debug:
-			{
-				// slave(M5StickC)へ接続
-				if (!blConnect)
-				{
-					if (tick % 50 == 0)
-					{
-						blConnect = SerialBT.connect(strSlaveName);
-						if (blConnect)
-						{
-							M5.Lcd.fillScreen(BLACK);
-							M5.Lcd.setTextSize(2);
-							M5.Lcd.setCursor(50, 20);
-							M5.Lcd.printf("Connected.");
-						}
-						else
-						{
-							M5.Lcd.fillScreen(BLACK);
-							M5.Lcd.setTextSize(2);
-							M5.Lcd.setCursor(50, 20);
-							M5.Lcd.printf("Not Connected.");
-						}
-					}
-				}
-
-				if (SerialBT.available())
-				{
-					std::string canData = "";
-					while (SerialBT.available())
-					{
-						char data = (char)SerialBT.read();
-						if (data == '\n')
-						{
-							break;
-						}
-						else
-						{
-							canData += data;
-						}
-					}
-
-					if (canData != "")
-					{
-						// レコードに含まれるカンマの数をカウント
-						uint32_t count = std::count(canData.begin(), canData.end(), target);
-						// 1レコードの最大のカンマ数は11のため(timestamp:1, msgID: 1, DLC:1, DataFrameの最大: 8)
-						// それ以外はデータ不正のため無視する
-						if (4 <= count && count <= 11)
-						{
-							lstBuff.push_back(canData);
-						}
-					}
-
-					// バッファに100件までのレコードを保持する
-					if (100 < lstBuff.size())
-					{
-						M5.Lcd.setTextSize(2);
-						M5.Lcd.setCursor(50, 100);
-						M5.Lcd.fillScreen(BLACK);
-						M5.Lcd.println("writing...");
-						M5.Lcd.setCursor(50, 150);
-						M5.Lcd.println(lstBuff[0].c_str());
-
-
-						// 出力ファイル作成
-						char fileName[99];  //csvファイル名を格納する変数
-						snprintf(fileName, 99, "/Data/log.csv");  //Dataフォルダにlog.csvを作成
-						csvFile = SD.open(fileName, FILE_APPEND);
-						// SDに書き込む
-						for (const auto& strCanData : lstBuff)
-						{
-							csvFile.print(strCanData.c_str());
-							csvFile.print("\n");
-						}
-						csvFile.close();
-
-						// バッファのクリア
-						lstBuff.clear();
-					}
-
-				}
-			}
-			break;
-		default:
-			break;
 	}
 }
 
@@ -312,11 +307,9 @@ bool drawAngleIndicator(float kalAngleY)
 	float magnification = 0.375;		// 角度60をMAXとしたときの倍率
 
 	// インジケータリセット
-	if (tick % 10 == 0){
-		for (uint8_t i = 0; i < lineBold; i++)
-		{
-			M5.Lcd.drawLine(0, 200+i, 320, 200+i,  BLACK);
-		}
+	for (uint8_t i = 0; i < lineBold; i++)
+	{
+		M5.Lcd.drawLine(0, 200+i, 320, 200+i,  BLACK);
 	}
 
 	// インジケータの色を選定
